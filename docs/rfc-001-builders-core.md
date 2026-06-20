@@ -297,7 +297,39 @@ CREATE TABLE technologies (
 );
 
 -- ============================================
--- 2. 活动与事件
+-- 2. 来源与证据（两层结构，前置以便后续表引用）
+-- ============================================
+
+-- 原始来源条目（一条推文/文章/API 结果）
+CREATE TABLE source_items (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_url TEXT NOT NULL,
+    source_platform TEXT,
+    author_name TEXT,
+    author_person_id UUID REFERENCES persons(id),
+    author_identity_id UUID REFERENCES identities(id),
+    title TEXT,
+    raw_content TEXT,
+    published_at TIMESTAMPTZ,
+    collected_at TIMESTAMPTZ DEFAULT now(),
+    content_hash TEXT,
+    created_by_task_id UUID,
+    UNIQUE(content_hash)
+);
+
+-- 从来源中抽取的证据/claim
+CREATE TABLE evidences (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_item_id UUID REFERENCES source_items(id),
+    claim TEXT NOT NULL,
+    excerpt TEXT,
+    confidence FLOAT DEFAULT 0.5,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    created_by_task_id UUID
+);
+
+-- ============================================
+-- 3. 活动与事件
 -- ============================================
 
 -- 活动/事件
@@ -338,13 +370,13 @@ CREATE TABLE activity_refs (
 CREATE TABLE activity_evidences (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     activity_id UUID REFERENCES activities(id),
-    evidence_id UUID,
+    evidence_id UUID REFERENCES evidences(id),
     link_type TEXT DEFAULT 'direct',
     UNIQUE(activity_id, evidence_id)
 );
 
 -- ============================================
--- 3. 关系
+-- 4. 关系
 -- ============================================
 
 -- 实体间关系（polymorphic，应用层保证引用一致性）
@@ -369,41 +401,9 @@ CREATE TABLE relationships (
 CREATE TABLE relationship_evidences (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     relationship_id UUID REFERENCES relationships(id),
-    evidence_id UUID,
+    evidence_id UUID REFERENCES evidences(id),
     link_type TEXT DEFAULT 'direct',
     UNIQUE(relationship_id, evidence_id)
-);
-
--- ============================================
--- 4. 来源与证据（两层结构）
--- ============================================
-
--- 原始来源条目（一条推文/文章/API 结果）
-CREATE TABLE source_items (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    source_url TEXT NOT NULL,
-    source_platform TEXT,
-    author_name TEXT,
-    author_identity_id UUID REFERENCES identities(id),
-    title TEXT,
-    raw_content TEXT,
-    published_at TIMESTAMPTZ,
-    collected_at TIMESTAMPTZ DEFAULT now(),
-    content_hash TEXT,
-    created_by_task_id UUID,
-    UNIQUE(content_hash)
-);
-
--- 从来源中抽取的证据/claim
-CREATE TABLE evidences (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    source_item_id UUID REFERENCES source_items(id),
-    claim TEXT NOT NULL,
-    excerpt TEXT,
-    confidence FLOAT DEFAULT 0.5,
-    link_type TEXT DEFAULT 'direct',
-    created_at TIMESTAMPTZ DEFAULT now(),
-    created_by_task_id UUID
 );
 
 -- 通用证据关联（补充 activity_evidences/relationship_evidences 未覆盖的场景）
@@ -441,11 +441,12 @@ CREATE TABLE person_activity_snapshots (
     summary TEXT,
     important_activity_ids UUID[],
     created_at TIMESTAMPTZ DEFAULT now(),
-    created_by_task_id UUID
+    created_by_task_id UUID,
+    UNIQUE(person_id, period_start, period_end)
 );
 
 -- ============================================
--- 6. 任务系统
+-- 6. 任务系统（status: open/claimed/in_progress/done/failed/cancelled）
 -- ============================================
 
 CREATE TABLE tasks (
@@ -492,6 +493,7 @@ CREATE INDEX idx_relationships_object ON relationships(object_type, object_id);
 CREATE INDEX idx_relationship_evidences_rel ON relationship_evidences(relationship_id);
 CREATE INDEX idx_source_items_url ON source_items(source_url);
 CREATE INDEX idx_source_items_platform ON source_items(source_platform);
+CREATE INDEX idx_source_items_author ON source_items(author_person_id);
 CREATE INDEX idx_evidences_source ON evidences(source_item_id);
 CREATE INDEX idx_evidence_links_linked ON evidence_links(linked_type, linked_id);
 CREATE INDEX idx_tracking_next ON person_tracking_policies(next_check_at) WHERE enabled = true;
