@@ -2,6 +2,7 @@
 
 > Status: Draft
 > Author: @Bryce
+> Reviewers: @戴清源, @GLM
 > TL: @earayu2
 > Date: 2026-06-20
 
@@ -69,7 +70,8 @@
 | `technology` | 技术标签/领域（AI agent/RAG/robotics 等） |
 | `activity` | 人的活动/事件（发推/演讲/发布/融资/入职/离职等） |
 | `relationship` | 实体间的持续关系，带时间维度 |
-| `evidence` | 原始证据（来源 URL、摘录、采集时间） |
+| `source_item` | 原始来源条目（一条推文/文章/API 结果） |
+| `evidence` | 从来源中抽取的 claim/excerpt，关联到活动或关系 |
 | `task` | agent 的采集/维护任务 |
 
 ## 4. 核心需求
@@ -89,11 +91,19 @@
 - 通过他人发现的活动（B 的推特提到 A 参加了某活动 → 更新到 A 的活动时间线）
 
 每条活动记录：
+- `primary_person_id`：活动的主体人物，方便直接查询某人的时间线
 - 活动类型（post/talk/launch/funding/hire/join/leave/publish/mention 等）
 - 现实发生时间 `occurred_at` + 系统发现时间 `discovered_at`
-- 参与者（多人参与同一活动）及其角色（subject/mentioned/speaker/author）
+- 参与者（多人参与同一活动）及其角色（subject/mentioned/speaker/author/source_author/witness）
 - 关联的组织/项目/技术
-- 原始证据（来源 URL、摘录）
+- 关联的证据（通过 `activity_evidences` 细粒度关联）
+
+**"B 发推证明 A 活动"的场景处理：**
+- B 的推文存为 `source_item`（记录内容发布者 B）
+- 从中抽取的 claim 存为 `evidence`，关联到 `source_item`
+- activity 的 `primary_person_id` 指向 A
+- `activity_participants` 中 A 为 `subject`，B 为 `source_author`
+- 证据链清晰：activity ← activity_evidences ← evidence ← source_item（作者 B）
 
 ### 4.3 关系网络
 
@@ -101,6 +111,7 @@
 - 关系带时间维度（`valid_from` / `valid_to`），可回答"A 去年在哪、现在在哪"
 - 关系类型：works_at / founded / maintains / authored / invested_in / advises / collaborated_with
 - 关系有角色描述（如 "Head of Agents"、"CTO"）
+- 每条关系通过 `relationship_evidences` 关联支撑证据
 
 ### 4.4 身份消歧
 
@@ -112,10 +123,12 @@
 
 ### 4.5 证据链管理
 
-每条数据都可追溯到原始来源：
-- 证据记录来源 URL、平台、原始内容/摘录、发布时间、采集时间、内容 hash
-- 活动、关系、实体更新都关联对应的证据
-- 支持去重（content_hash）
+采用两层结构，分离"原始来源"和"抽取的证据"：
+
+- **source_item**：原始来源条目（一条推文/文章/API 返回），记录作者、URL、发布时间、原文 hash。解决"内容发布者"和"活动主体"的归属区分。
+- **evidence**：从 source_item 中抽取的具体 claim/excerpt，关联到活动或关系。
+
+活动和关系通过细粒度关联表（`activity_evidences` / `relationship_evidences`）连接证据，支持标注证据类型（direct / indirect / inferred / conflicting）。
 
 ### 4.6 数据自动置信度
 
@@ -126,6 +139,14 @@
 - `conflict`：证据冲突，不自动覆盖
 
 冲突证据处理：都保留并标注 confidence，AI 自动判断，profile 展示时标注冲突。
+
+### 4.7 定期活动追踪
+
+每个人可配置追踪策略，定期收集活动并生成快照：
+
+- **person_tracking_policies**：配置追踪频率、数据源范围、上次/下次检查时间
+- **person_activity_snapshots**：每周/每月 summary，包含重要活动 ID 列表
+- snapshot 是派生展示层，事实源仍然是 activities/evidences
 
 ## 5. 任务系统
 
@@ -139,8 +160,10 @@
 ### 5.2 任务流程
 
 ```
-发布任务 → agent 领取 → agent 做任务（直接更新主库） → agent 标记完成
+发布任务(open) → agent 领取(claimed) → 执行中(in_progress) → 完成(done) / 失败(failed)
 ```
+
+支持的状态：`open` / `claimed` / `in_progress` / `done` / `failed` / `cancelled`
 
 ### 5.3 任务类型
 
@@ -182,9 +205,16 @@
 - **更新时效**：每日 batch，不需要实时
 - **语言**：全球，中英文优先
 
-### 6.2 完整 DDL
+### 6.2 设计说明
+
+- **Polymorphic 字段**（`subject_type/subject_id`、`ref_type/ref_id`、`linked_type/linked_id`）不使用 PG 外键约束，由应用层保证引用一致性。V1 可接受，后续可加 CHECK 约束或触发器。
+- **Tombstone 支持**：核心实体表包含 `deleted_at` 字段，支持软删除，为后续纠错/删除预留。
+
+### 6.3 完整 DDL
 
 ```sql
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- ============================================
 -- 1. 核心实体
 -- ============================================
@@ -201,6 +231,7 @@ CREATE TABLE persons (
     role_tags TEXT[],
     status TEXT DEFAULT 'active',
     last_refreshed_at TIMESTAMPTZ,
+    deleted_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now(),
     created_by_task_id UUID
@@ -218,6 +249,7 @@ CREATE TABLE identities (
     confidence FLOAT DEFAULT 0.5,
     merge_reason TEXT,
     evidence_urls TEXT[],
+    deleted_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT now(),
     created_by_task_id UUID,
     UNIQUE(platform, platform_uid)
@@ -233,6 +265,7 @@ CREATE TABLE organizations (
     website TEXT,
     region TEXT,
     status TEXT DEFAULT 'active',
+    deleted_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now(),
     created_by_task_id UUID
@@ -249,6 +282,7 @@ CREATE TABLE projects (
     repo_url TEXT,
     org_id UUID REFERENCES organizations(id),
     status TEXT DEFAULT 'active',
+    deleted_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now(),
     created_by_task_id UUID
@@ -270,15 +304,14 @@ CREATE TABLE technologies (
 CREATE TABLE activities (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     activity_type TEXT NOT NULL,
+    primary_person_id UUID REFERENCES persons(id),
     title TEXT,
     summary TEXT,
     occurred_at TIMESTAMPTZ,
     occurred_at_precision TEXT DEFAULT 'day',
     discovered_at TIMESTAMPTZ DEFAULT now(),
-    source_url TEXT,
-    source_platform TEXT,
-    raw_excerpt TEXT,
     confidence FLOAT DEFAULT 0.5,
+    deleted_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT now(),
     created_by_task_id UUID
 );
@@ -288,11 +321,11 @@ CREATE TABLE activity_participants (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     activity_id UUID REFERENCES activities(id),
     person_id UUID REFERENCES persons(id),
-    role TEXT,
+    role TEXT NOT NULL,
     UNIQUE(activity_id, person_id, role)
 );
 
--- 活动关联实体
+-- 活动关联实体（polymorphic，应用层保证引用一致性）
 CREATE TABLE activity_refs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     activity_id UUID REFERENCES activities(id),
@@ -301,10 +334,20 @@ CREATE TABLE activity_refs (
     role TEXT
 );
 
+-- 活动-证据关联
+CREATE TABLE activity_evidences (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    activity_id UUID REFERENCES activities(id),
+    evidence_id UUID,
+    link_type TEXT DEFAULT 'direct',
+    UNIQUE(activity_id, evidence_id)
+);
+
 -- ============================================
 -- 3. 关系
 -- ============================================
 
+-- 实体间关系（polymorphic，应用层保证引用一致性）
 CREATE TABLE relationships (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     subject_type TEXT NOT NULL,
@@ -316,32 +359,55 @@ CREATE TABLE relationships (
     valid_from TIMESTAMPTZ,
     valid_to TIMESTAMPTZ,
     confidence FLOAT DEFAULT 0.5,
-    source_url TEXT,
+    deleted_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now(),
     created_by_task_id UUID
 );
 
+-- 关系-证据关联
+CREATE TABLE relationship_evidences (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    relationship_id UUID REFERENCES relationships(id),
+    evidence_id UUID,
+    link_type TEXT DEFAULT 'direct',
+    UNIQUE(relationship_id, evidence_id)
+);
+
 -- ============================================
--- 4. 证据
+-- 4. 来源与证据（两层结构）
 -- ============================================
 
-CREATE TABLE evidences (
+-- 原始来源条目（一条推文/文章/API 结果）
+CREATE TABLE source_items (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     source_url TEXT NOT NULL,
     source_platform TEXT,
+    author_name TEXT,
+    author_identity_id UUID REFERENCES identities(id),
     title TEXT,
     raw_content TEXT,
-    excerpt TEXT,
     published_at TIMESTAMPTZ,
     collected_at TIMESTAMPTZ DEFAULT now(),
     content_hash TEXT,
-    confidence FLOAT DEFAULT 0.5,
     created_by_task_id UUID,
     UNIQUE(content_hash)
 );
 
--- 证据关联
+-- 从来源中抽取的证据/claim
+CREATE TABLE evidences (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_item_id UUID REFERENCES source_items(id),
+    claim TEXT NOT NULL,
+    excerpt TEXT,
+    confidence FLOAT DEFAULT 0.5,
+    link_type TEXT DEFAULT 'direct',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    created_by_task_id UUID
+);
+
+-- 通用证据关联（补充 activity_evidences/relationship_evidences 未覆盖的场景）
+-- polymorphic，应用层保证引用一致性
 CREATE TABLE evidence_links (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     evidence_id UUID REFERENCES evidences(id),
@@ -350,7 +416,36 @@ CREATE TABLE evidence_links (
 );
 
 -- ============================================
--- 5. 任务系统
+-- 5. 追踪策略与快照
+-- ============================================
+
+-- 人物追踪策略
+CREATE TABLE person_tracking_policies (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    person_id UUID REFERENCES persons(id) UNIQUE,
+    frequency TEXT DEFAULT 'weekly',
+    source_scope TEXT[],
+    last_checked_at TIMESTAMPTZ,
+    next_check_at TIMESTAMPTZ,
+    enabled BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- 人物活动快照（周/月 summary，派生展示层）
+CREATE TABLE person_activity_snapshots (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    person_id UUID REFERENCES persons(id),
+    period_start TIMESTAMPTZ NOT NULL,
+    period_end TIMESTAMPTZ NOT NULL,
+    summary TEXT,
+    important_activity_ids UUID[],
+    created_at TIMESTAMPTZ DEFAULT now(),
+    created_by_task_id UUID
+);
+
+-- ============================================
+-- 6. 任务系统
 -- ============================================
 
 CREATE TABLE tasks (
@@ -360,7 +455,7 @@ CREATE TABLE tasks (
     target_id UUID,
     description TEXT,
     priority INT DEFAULT 0,
-    status TEXT DEFAULT 'queued',
+    status TEXT DEFAULT 'open',
     claimed_by TEXT,
     claimed_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
@@ -377,21 +472,30 @@ CREATE TABLE task_comments (
 );
 
 -- ============================================
--- 6. 索引
+-- 7. 索引
 -- ============================================
 
 CREATE INDEX idx_persons_name ON persons(canonical_name);
+CREATE INDEX idx_persons_deleted ON persons(deleted_at) WHERE deleted_at IS NULL;
 CREATE INDEX idx_identities_person ON identities(person_id);
 CREATE INDEX idx_identities_platform ON identities(platform, platform_uid);
 CREATE INDEX idx_activities_type ON activities(activity_type);
+CREATE INDEX idx_activities_primary_person ON activities(primary_person_id);
 CREATE INDEX idx_activities_occurred ON activities(occurred_at);
 CREATE INDEX idx_activities_discovered ON activities(discovered_at);
 CREATE INDEX idx_activity_participants_person ON activity_participants(person_id);
 CREATE INDEX idx_activity_participants_activity ON activity_participants(activity_id);
+CREATE INDEX idx_activity_evidences_activity ON activity_evidences(activity_id);
+CREATE INDEX idx_activity_evidences_evidence ON activity_evidences(evidence_id);
 CREATE INDEX idx_relationships_subject ON relationships(subject_type, subject_id);
 CREATE INDEX idx_relationships_object ON relationships(object_type, object_id);
-CREATE INDEX idx_evidences_url ON evidences(source_url);
+CREATE INDEX idx_relationship_evidences_rel ON relationship_evidences(relationship_id);
+CREATE INDEX idx_source_items_url ON source_items(source_url);
+CREATE INDEX idx_source_items_platform ON source_items(source_platform);
+CREATE INDEX idx_evidences_source ON evidences(source_item_id);
 CREATE INDEX idx_evidence_links_linked ON evidence_links(linked_type, linked_id);
+CREATE INDEX idx_tracking_next ON person_tracking_policies(next_check_at) WHERE enabled = true;
+CREATE INDEX idx_snapshots_person ON person_activity_snapshots(person_id);
 CREATE INDEX idx_tasks_status ON tasks(status);
 CREATE INDEX idx_tasks_target ON tasks(target_type, target_id);
 ```
@@ -445,33 +549,37 @@ CREATE INDEX idx_tasks_target ON tasks(target_type, target_id);
 │              数据层（PostgreSQL）             │
 │  persons │ identities │ organizations        │
 │  projects │ activities │ relationships        │
-│  evidences │ technologies                     │
+│  source_items │ evidences │ technologies      │
 └─────────────────────────────────────────────┘
 ```
 
 ### 8.2 典型流程：更新某人 Profile
 
-1. 系统检测到某人 `last_refreshed_at` 过期，自动创建 `refresh_person_profile` 任务
+1. 系统检测到某人 `last_refreshed_at` 过期（或 `person_tracking_policies.next_check_at` 到期），自动创建 `refresh_person_profile` 任务
 2. Agent 领取任务
 3. Agent 查询该人当前的 identities（GitHub/X/LinkedIn 账号）
 4. Agent 逐平台采集最新信息：
    - GitHub：最近 commits/repos/stars
    - X：最近推文和互动
    - 搜索引擎：最近新闻/访谈/演讲
-5. Agent 将新发现的活动写入 `activities` 表，关联 `activity_participants`
-6. Agent 更新 `relationships`（如发现换了公司）
-7. Agent 保存证据到 `evidences` 表
-8. Agent 更新 `persons.last_refreshed_at`
-9. Agent 标记任务完成
+5. Agent 将原始内容存入 `source_items`，抽取的 claim 存入 `evidences`
+6. Agent 将新发现的活动写入 `activities` 表，通过 `activity_evidences` 关联证据
+7. Agent 更新 `relationships`（如发现换了公司），通过 `relationship_evidences` 关联证据
+8. Agent 更新 `persons.last_refreshed_at` 和 `person_tracking_policies`
+9. Agent 标记任务完成，留下 task_comment 总结
 10. 如发现新的 builder/项目，agent 创建后续任务
 
 ### 8.3 典型流程：通过 B 发现 A 的活动
 
 1. Agent 在采集 B 的推特时，发现 B 提到"和 A 一起参加了 XX 会议"
-2. Agent 创建 activity（type=`talk`，title="XX 会议"）
-3. Agent 在 `activity_participants` 中关联 B（role=`subject`）和 A（role=`mentioned`）
-4. A 的活动时间线查询 `activity_participants` 时自动包含这条活动
-5. 如果 A 还不在系统中，agent 创建新的 person 和 `discover_accounts` 后续任务
+2. Agent 将 B 的推文存入 `source_items`（author 为 B）
+3. Agent 从推文中抽取 claim 存入 `evidences`（关联 source_item）
+4. Agent 创建 activity（type=`talk`，title="XX 会议"，primary_person_id=A）
+5. Agent 在 `activity_participants` 中关联：A（role=`subject`）、B（role=`source_author`）
+6. Agent 通过 `activity_evidences` 关联证据到活动
+7. A 的活动时间线查询 `primary_person_id=A` 或 `activity_participants` 均可看到这条活动
+8. 证据链完整：activity ← activity_evidences ← evidence ← source_item（作者 B）
+9. 如果 A 还不在系统中，agent 创建新的 person 和 `discover_accounts` 后续任务
 
 ## 9. 第一版目标人群
 
@@ -501,7 +609,7 @@ CREATE INDEX idx_tasks_target ON tasks(target_type, target_id);
 - 记录来源和采集时间
 - 排除敏感个人信息、非职业信息、私人联系方式
 - 注意各平台 ToS、robots.txt、API 限制
-- Schema 从第一天支持 tombstone（软删除），为后续纠错/删除预留
+- Schema 支持 tombstone（软删除，`deleted_at` 字段），为后续纠错/删除预留
 
 ## 11. 开放问题
 
@@ -511,7 +619,7 @@ CREATE INDEX idx_tasks_target ON tasks(target_type, target_id);
 | Jina API key | 待 @earayu2 提供 |
 | OpenCLI 凭据配置 | 待 @earayu2 配置 |
 | 第一批种子名单 | 待定义 |
-| 删除/纠错/申诉机制 | V1 暂不做，schema 预留 |
+| 删除/纠错/申诉机制 | V1 暂不做，schema 已预留 |
 | 与知识库/RAG 项目的接口协议 | 待定义 |
 
 ## 12. 里程碑
